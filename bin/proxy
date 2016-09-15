@@ -1,0 +1,139 @@
+#!/usr/bin/env node
+
+"use strict";
+
+const http = require('http'),
+    net = require('net'),
+    url = require('url'),
+    debug = require('debug')('proxy');
+
+const proxyPort = 60000;
+let proxies = [];
+
+try {
+    if (process.env.PROXIES !== undefined) {
+        proxies = JSON.parse(process.env.PROXIES);
+    }
+} catch (e) {
+    debug('Wrong PROXIES var format. %s %s', e.message, e.stack);
+    process.exit();
+}
+
+/**
+ * @return {object}
+ */
+const rotateProxyAddress = () => {
+    const proxyAddress = proxies.shift();
+    if (proxyAddress) {
+        proxies.push(proxyAddress);
+    }
+    return proxyAddress;
+};
+
+/**
+ * @param {ClientRequest} request
+ * @param {object} proxy
+ * @param {boolean} [ssl]
+ */
+const getOptions = (request, proxy, ssl) => {
+    const options = {
+        port: proxy.port,
+        hostname: proxy.host,
+        method: request.method,
+        path: request.url,
+        headers: request.headers || {}
+    };
+    if (proxy.auth) {
+        options.headers['Proxy-Authorization'] = 'Basic ' + new Buffer(proxy.auth).toString('base64');
+    }
+
+    if (ssl !== undefined) {
+        const ph = url.parse('http://' + request.url);
+        options.method = 'CONNECT';
+        options.path = ph.hostname + ':' + (ph.port || 80);
+    }
+
+    return options;
+};
+
+const server = http.createServer();
+server.on('request', (request, response) => {
+    debug('Request %s %s', request.method, request.url);
+    const options = getOptions(request, rotateProxyAddress());
+    const proxy = http.request(options);
+
+    proxy
+        .on('error', (err) => {
+            debug('[error] ' + err);
+            response.end();
+        })
+        .on('response', (proxyResponse) => {
+            debug('Response received');
+            if (proxyResponse.statusCode === 407) {
+                debug('[error] AUTH REQUIRED');
+                process.exit();
+            }
+            proxyResponse.on('data', (chunk) => {
+                response.write(chunk, 'binary');
+            });
+            proxyResponse.on('end', () => {
+                response.end();
+            });
+            response.writeHead(proxyResponse.statusCode, proxyResponse.headers);
+        });
+
+    request
+        .on('data', (chunk) => {
+            proxy.write(chunk, 'binary');
+        })
+        .on('end', () => {
+            proxy.end();
+        });
+
+    proxy.end();
+});
+server.on('connect', (request, socketRequest) => {
+    debug('Request %s %s', request.method, request.url);
+    const options = getOptions(request, rotateProxyAddress(), true);
+
+    const proxy = http.request(options);
+    proxy
+        .on('error', (err) => {
+            debug('[error] ' + err);
+            process.exit();
+        })
+        .on('connect', (res, socket) => {
+            // assert.equal(res.statusCode, 200);
+            // assert.equal(head.length, 0);
+            socketRequest.write("HTTP/" + request.httpVersion + " 200 Connection established\r\n\r\n");
+
+            // tunneling to host
+            socket
+                .on('data', (chunk) => {
+                    socketRequest.write(chunk, 'binary');
+                })
+                .on('end', () => {
+                    socketRequest.end();
+                })
+                .on('error', () => {
+                    // notify client about an error
+                    socketRequest.write("HTTP/" + request.httpVersion + " 500 Connection error\r\n\r\n");
+                    socketRequest.end();
+                });
+
+            // tunneling to client
+            socketRequest
+                .on('data', (chunk) => {
+                    socket.write(chunk, 'binary');
+                })
+                .on('end', () => {
+                    socket.end();
+                })
+                .on('error', () => {
+                    socket.end();
+                });
+        }).end();
+});
+
+debug('Start proxy on port %s', proxyPort);
+server.listen(proxyPort);
